@@ -4,6 +4,10 @@
 路由：
   GET  /health   -> {"status": "ok"}
   POST /assemble -> {"sequences": [...]} -> unique / ambiguous / no_solution
+
+请求可选布尔字段 unknown_orientation（默认 false，兼容历史行为）：
+为 true 时按"方向未知"批次处理——每条读数可独立取原序列或反向互补，
+定向与闭环次序由服务端联合求解。
 """
 from __future__ import annotations
 
@@ -15,6 +19,18 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from barcode import ValidationError, assemble
 
 API_PORT = int(os.environ.get("API_PORT", "8080"))
+
+
+def _coerce_flag(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        low = value.strip().lower()
+        if low in ("true", "1", "yes", "on"):
+            return True
+        if low in ("false", "0", "no", "off", ""):
+            return False
+    raise ValidationError("unknown_orientation 必须是布尔值 true/false")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -46,7 +62,8 @@ class Handler(BaseHTTPRequestHandler):
             data = json.loads(raw.decode("utf-8")) if raw else {}
             if not isinstance(data, dict) or "sequences" not in data:
                 raise ValidationError("请求体必须是包含 sequences 字段的 JSON 对象")
-            result = assemble(data["sequences"])
+            unknown = _coerce_flag(data.get("unknown_orientation", False))
+            result = assemble(data["sequences"], unknown_orientation=unknown)
             self._send_json(200, result)
         except ValidationError as exc:
             self._send_json(400, {"status": "invalid_input", "error": str(exc)})

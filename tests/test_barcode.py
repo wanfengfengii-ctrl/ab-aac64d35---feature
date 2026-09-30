@@ -40,6 +40,30 @@ def brute_classes(reads: list[str]) -> set[str]:
     return classes
 
 
+def brute_unknown_classes(reads: list[str]) -> set[str]:
+    """方向未知参照：锚定首条正向（整环反向互补等价），枚举其余 2^(n-1)
+    种定向与全部 (n-1)! 种次序，收集不同规范环。"""
+    n = len(reads)
+    rcs = [reverse_complement(s) for s in reads]
+    classes = set()
+    for bits in range(1 << (n - 1)):
+        labels = [reads[0]]
+        for j in range(1, n):
+            labels.append(reads[j] if (bits >> (j - 1)) & 1 == 0 else rcs[j])
+        for perm in itertools.permutations(range(1, n)):
+            order = [0] + list(perm)
+            if all(
+                labels[order[p]][1:] == labels[order[(p + 1) % n]][:-1]
+                for p in range(n)
+            ):
+                circle = labels[0] + "".join(
+                    labels[order[i]][-1] for i in range(1, n)
+                )
+                classes.add(canonical_circle(circle[:n]))
+    return classes
+
+
+
 def check_witness(test: unittest.TestCase, w: dict, reads: list[str], k: int) -> None:
     """见证内部一致性：次序、重叠证据、条码窗口、规范代表。"""
     n = len(reads)
@@ -59,6 +83,42 @@ def check_witness(test: unittest.TestCase, w: dict, reads: list[str], k: int) ->
         test.assertEqual(ev["overlap_length"], k)
         test.assertEqual(ev["appended_base"], b[-1])
         test.assertEqual(doubled[pos:pos + length], reads[w["order"][pos] - 1])
+    test.assertEqual(canonical_circle(w["barcode"]), w["canonical_barcode"])
+
+
+def oriented_read(w: dict, reads: list[str], pos: int) -> str:
+    """见证第 pos 位实际采用方向后的读数。"""
+    s = reads[w["order"][pos] - 1]
+    return s if w["orientations"][pos] == "forward" else reverse_complement(s)
+
+
+def check_unknown_witness(
+    test: unittest.TestCase, w: dict, reads: list[str], k: int
+) -> None:
+    """方向未知见证的逐项一致性：采用方向、定向后序列、相邻重叠。"""
+    n = len(reads)
+    length = k + 1
+    test.assertEqual(sorted(w["order"]), list(range(1, n + 1)))
+    test.assertEqual(len(w["evidence"]), n)
+    test.assertEqual(len(w["orientations"]), n)
+    test.assertEqual(w["canonical_barcode"], w["barcode"])
+    reps = (n + length) // n + 1
+    doubled = w["barcode"] * reps
+    labels = [oriented_read(w, reads, pos) for pos in range(n)]
+    for pos, ev in enumerate(w["evidence"]):
+        test.assertEqual(ev["position"], pos)
+        test.assertEqual(ev["read"], w["order"][pos])
+        test.assertEqual(ev["prev"], w["order"][pos])
+        test.assertEqual(ev["next"], w["order"][(pos + 1) % n])
+        test.assertEqual(ev["orientation"], w["orientations"][pos])
+        test.assertEqual(ev["original_sequence"], reads[w["order"][pos] - 1])
+        test.assertEqual(ev["oriented_sequence"], labels[pos])
+        nxt = labels[(pos + 1) % n]
+        test.assertEqual(labels[pos][1:], nxt[:-1])
+        test.assertEqual(ev["overlap"], labels[pos][1:])
+        test.assertEqual(ev["overlap_length"], k)
+        test.assertEqual(ev["appended_base"], nxt[-1])
+        test.assertEqual(doubled[pos:pos + length], labels[pos])
     test.assertEqual(canonical_circle(w["barcode"]), w["canonical_barcode"])
 
 
@@ -237,6 +297,206 @@ class BruteForceCrossCheck(unittest.TestCase):
                 got = {w["canonical_barcode"] for w in r["witnesses"]}
                 self.assertEqual(len(got), 2)
                 self.assertTrue(got <= expected)
+
+
+class UnknownOrientationTests(unittest.TestCase):
+    """方向未知模式：每条读数可独立正向或反向互补，定向与次序联合求解。"""
+
+    READS = ["AAT", "ATC", "TCG", "CGC", "GCA", "CAA"]  # 环 AATCGC
+
+    def test_forward_only_submission(self):
+        r = assemble(list(self.READS), unknown_orientation=True)
+        self.assertEqual(r["status"], "unique")
+        self.assertEqual(r["canonical_barcode"], "AATCGC")
+        self.assertEqual(r["orientation_mode"], "unknown")
+        self.assertEqual(r["orientations"], ["forward"] * 6)
+        check_unknown_witness(self, r, self.READS, 2)
+
+    def test_per_read_flips_recovered_jointly(self):
+        # 随机翻转其中 4 条：不能靠整批翻转，必须逐条定向
+        flipped = [reverse_complement(s) if i in (0, 3, 4, 5) else s
+                   for i, s in enumerate(self.READS)]
+        r = assemble(list(flipped), unknown_orientation=True)
+        self.assertEqual(r["status"], "unique")
+        self.assertEqual(r["canonical_barcode"], "AATCGC")
+        self.assertEqual(sorted(r["order"]), [1, 2, 3, 4, 5, 6])
+        check_unknown_witness(self, r, flipped, 2)
+        # 被翻转的读数在见证中必须以 reverse_complement 恢复回环方向
+        by_read = {r["order"][p]: r["orientations"][p]
+                   for p, _ in enumerate(r["order"])}
+        for i in (0, 3, 4, 5):
+            self.assertEqual(by_read[i + 1], "reverse_complement")
+        self.assertEqual(by_read[2], "forward")
+
+    def test_single_flip_that_fixed_mode_cannot_close(self):
+        # 只翻转一条读数：固定方向报度数失衡，方向未知可闭环
+        broken = list(self.READS)
+        broken[0] = reverse_complement(broken[0])  # AAT -> ATT
+        rf = assemble(list(broken))
+        self.assertEqual(rf["status"], "no_solution")
+        self.assertIn("degree_imbalance",
+                      {x["code"] for x in rf["reasons"]})
+        ru = assemble(list(broken), unknown_orientation=True)
+        self.assertEqual(ru["status"], "unique")
+        self.assertEqual(ru["canonical_barcode"], "AATCGC")
+        check_unknown_witness(self, ru, broken, 2)
+
+    def test_each_index_used_exactly_once(self):
+        flipped = [reverse_complement(s) for s in self.READS]
+        r = assemble(list(flipped), unknown_orientation=True)
+        self.assertEqual(sorted(r["order"]), list(range(1, 7)))
+        # 即便全部反向互补，也是逐条定向的结果，而非整批翻转的特判
+        self.assertEqual(set(r["orientations"]), {"reverse_complement"})
+        check_unknown_witness(self, r, flipped, 2)
+
+    def test_palindromic_reads_direction_collapsed(self):
+        # AAA 回文：正反向序列相同，见证统一记 forward，且可拼 AAAAAA
+        reads = ["AAA"] * 6
+        r = assemble(list(reads), unknown_orientation=True)
+        self.assertEqual(r["status"], "unique")
+        self.assertEqual(r["canonical_barcode"], "AAAAAA")
+        self.assertEqual(r["orientations"], ["forward"] * 6)
+        check_unknown_witness(self, r, reads, 2)
+
+    def test_equivalent_orientations_not_ambiguous(self):
+        # 周期环 ATATAT：每条读数的两个方向都能参与同一闭环，
+        # 同一条码的多种等价定向不得制造歧义。
+        reads = reads_of("ATATAT", 3)
+        r = assemble(list(reads), unknown_orientation=True)
+        self.assertEqual(r["status"], "unique")
+        self.assertEqual(r["canonical_barcode"], "ATATAT")
+        check_unknown_witness(self, r, reads, 2)
+
+    def test_duplicate_reads_with_mixed_flips(self):
+        # 周期环 AAC 的两组重复读数，分别做逐条翻转
+        reads = ["AAC", "ACA", "CAA", "AAC", "ACA", "CAA"]
+        flipped = [reverse_complement(s) if i in (0, 2, 4) else s
+                   for i, s in enumerate(reads)]
+        r = assemble(list(flipped), unknown_orientation=True)
+        self.assertEqual(r["status"], "unique")
+        self.assertEqual(r["canonical_barcode"], "AACAAC")
+        check_unknown_witness(self, r, flipped, 2)
+
+    def test_ambiguous_still_two_stable_witnesses(self):
+        # 即便允许逐条定向，两个规范类仍然不同
+        reads = ['ATT', 'AGA', 'TTA', 'TAA', 'GAT', 'TAT', 'TAT', 'AAG']
+        r = assemble(list(reads), unknown_orientation=True)
+        self.assertEqual(r["status"], "ambiguous")
+        self.assertEqual(len(r["witnesses"]), 2)
+        barcodes = {w["canonical_barcode"] for w in r["witnesses"]}
+        self.assertEqual(barcodes, {"AAGATAAT", "AAGATATT"})
+        for w in r["witnesses"]:
+            check_unknown_witness(self, w, reads, 2)
+        # 稳定：重复调用结果一致
+        r2 = assemble(list(reads), unknown_orientation=True)
+        self.assertEqual(
+            [w["order"] for w in r2["witnesses"]],
+            [w["order"] for w in r["witnesses"]],
+        )
+
+    def test_group_odd_degree_reason(self):
+        # AAT/TAA 的配对组 {AA,TT} 度 3（奇），{AT} 度 3（奇）
+        reads = ["AAT", "TAA", "AAT", "TAA", "AAT", "TAA"]
+        r = assemble(list(reads), unknown_orientation=True)
+        self.assertEqual(r["status"], "no_solution")
+        codes = {x["code"] for x in r["reasons"]}
+        self.assertEqual(codes, {"orientation_group_imbalance"})
+        odd = r["reasons"][0]["odd_degree_groups"]
+        groups = {tuple(g["group"]): g["degree"] for g in odd}
+        self.assertEqual(groups, {("AT",): 3, ("TA",): 3})
+
+    def test_group_fragmentation_reason(self):
+        reads = ["AAA", "AAA", "AAA", "CCC", "CCC", "CCC"]
+        r = assemble(list(reads), unknown_orientation=True)
+        self.assertEqual(r["status"], "no_solution")
+        codes = {x["code"] for x in r["reasons"]}
+        self.assertEqual(codes, {"orientation_group_fragmented"})
+        self.assertEqual(r["reasons"][0]["component_count"], 2)
+
+    def test_exhaustive_unsatisfiable_not_degree_imbalance(self):
+        # 通过组级必要条件、但任何逐条定向都无法闭环：
+        # 必须给方向约束不可满足的可复核原因，而不是固定方向度数失衡。
+        reads = ['GTC', 'TCT', 'ACG', 'GCG', 'GCC', 'AGG']
+        rf = assemble(list(reads))
+        self.assertEqual(rf["status"], "no_solution")  # 固定方向确有度数失衡
+        r = assemble(list(reads), unknown_orientation=True)
+        self.assertEqual(r["status"], "no_solution")
+        codes = {x["code"] for x in r["reasons"]}
+        self.assertEqual(codes, {"orientation_constraints_unsatisfiable"})
+        self.assertNotIn("degree_imbalance", codes)
+        reason = r["reasons"][0]
+        self.assertGreaterEqual(reason["searched_states"], 1)
+        self.assertTrue(reason["dead_end_examples"])
+        de = reason["dead_end_examples"][0]
+        self.assertIn("at_kmer", de)
+        self.assertIn("candidate_edges", de)
+
+    def test_shuffled_flips_stable_and_deterministic(self):
+        rng = random.Random(20260930)
+        for _ in range(20):
+            n = rng.randint(6, 9)
+            circle = "".join(rng.choice("ACGT") for _ in range(n))
+            reads = reads_of(circle, 3)
+            reads = [reverse_complement(s) if rng.random() < 0.5 else s
+                     for s in reads]
+            rng.shuffle(reads)
+            r1 = assemble(list(reads), unknown_orientation=True)
+            r2 = assemble(list(reads), unknown_orientation=True)
+            self.assertEqual(r1["status"], r2["status"])
+            if r1["status"] == "unique":
+                self.assertEqual(r1["order"], r2["order"])
+                self.assertEqual(r1["orientations"], r2["orientations"])
+                check_unknown_witness(self, r1, reads, 2)
+            elif r1["status"] == "ambiguous":
+                for w1, w2 in zip(r1["witnesses"], r2["witnesses"]):
+                    self.assertEqual(w1["order"], w2["order"])
+                    check_unknown_witness(self, w1, reads, 2)
+
+    def test_brute_force_cross_check(self):
+        """随机环+逐条翻转：求解器结论与 2^(n-1)*(n-1)! 暴力枚举一致。"""
+        rng = random.Random(20260931)
+        for _ in range(40):
+            n = rng.randint(6, 7)
+            circle = "".join(rng.choice("AC") for _ in range(n))
+            reads = reads_of(circle, 3)
+            reads = [reverse_complement(s) if rng.random() < 0.5 else s
+                     for s in reads]
+            rng.shuffle(reads)
+            expected = brute_unknown_classes(reads)
+            self.assertTrue(expected)
+            r = assemble(list(reads), unknown_orientation=True)
+            if len(expected) == 1:
+                self.assertEqual(r["status"], "unique", reads)
+                self.assertEqual(r["canonical_barcode"], next(iter(expected)))
+                check_unknown_witness(self, r, reads, 2)
+            else:
+                self.assertEqual(r["status"], "ambiguous", reads)
+                got = {w["canonical_barcode"] for w in r["witnesses"]}
+                self.assertEqual(len(got), 2)
+                self.assertTrue(got <= expected)
+
+
+class CompatibilityTests(unittest.TestCase):
+    """未启用方向未知时，原有输入、结论与证据结构完全兼容。"""
+
+    READS = ["AAT", "ATC", "TCG", "CGC", "GCA", "CAA"]
+
+    def test_default_equals_false(self):
+        a = assemble(list(self.READS))
+        b = assemble(list(self.READS), unknown_orientation=False)
+        self.assertEqual(a, b)
+        self.assertNotIn("orientation_mode", a)
+        self.assertNotIn("orientations", a)
+        # 固定模式证据不含方向字段
+        self.assertNotIn("orientation", a["evidence"][0])
+        self.assertNotIn("oriented_sequence", a["evidence"][0])
+
+    def test_existing_fixtures_unchanged(self):
+        r = assemble(list(self.READS))
+        self.assertEqual(r["status"], "unique")
+        self.assertEqual(r["canonical_barcode"], "AATCGC")
+        self.assertEqual(r["order"], [1, 2, 3, 4, 5, 6])
+        check_witness(self, r, self.READS, 2)
 
 
 if __name__ == "__main__":

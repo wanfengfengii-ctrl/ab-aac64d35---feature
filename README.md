@@ -15,6 +15,19 @@
 - **无解**：给出可复核原因——`degree_imbalance`（入度≠出度的 k-mer 清单）
   和/或 `fragmented_graph`（非零度顶点的弱连通分量）。
 
+**方向未知批次**（`POST /assemble` 加 `"unknown_orientation": true`）：
+部分测序批次会丢失单条读数的链方向。启用后每条读数可独立按**原序列或其
+反向互补**参与拼接，但每个输入序号仍只能使用一次；"逐条定向"与"闭环
+次序"在同一次 DFS 中**联合求解**（不是只尝试整批翻转）。无解时返回方向
+松弛后的可复核原因，而非沿用固定方向下会误导分析员的度数失衡：
+
+- `orientation_group_imbalance`：把 k-mer 与它的反向互补归为同一配对组后，
+  存在关联读数条数为奇数的组（翻转只改变组间方向、不改变组，奇度无法消除）；
+- `orientation_group_fragmented`：配对组落在多个互不连通的分量中；
+- `orientation_constraints_unsatisfiable`：通过上述必要条件但联合穷尽枚举
+  仍无法闭环，附搜索统计与 `dead_end_examples`（停在哪个 k-mer、剩余读数
+  各自两种定向的候选边），可逐项复核。
+
 规范等价归一化：
 
 1. 环的循环移位；
@@ -36,7 +49,17 @@
 { "sequences": ["AAT", "ATC", "TCG", "CGC", "GCA", "CAA"] }
 ```
 
-响应 `status` 为 `unique` / `ambiguous` / `no_solution`（非法输入返回 400）。
+方向未知批次追加布尔字段（缺省/false 时与历史版本完全兼容）：
+
+```json
+{
+  "sequences": ["ATT", "ATC", "TCG", "CGC", "GCA", "TTG"],
+  "unknown_orientation": true
+}
+```
+
+响应 `status` 为 `unique` / `ambiguous` / `no_solution`（非法输入返回 400，
+非法 `unknown_orientation` 值同样返回 400）。
 
 `unique` 响应包含：
 
@@ -47,6 +70,16 @@
   `appended_base`），最后一条与首条首尾相接。
 
 `ambiguous` 响应在 `witnesses` 中给出两条不同规范见证（结构同上）。
+
+方向未知模式额外包含 `orientation_mode: "unknown"` 以及：
+
+- `orientations`：与 `order` 对齐的采用方向（`forward` / `reverse_complement`）；
+- 每条证据额外给出 `orientation`、`original_sequence`、`oriented_sequence`，
+  即逐项返回**采用方向、定向后序列及相邻重叠**；`barcode` 已对齐到规范代表。
+
+规范归并仍按循环移位与整条反向互补进行：同一条码的多种等价定向（如周期
+环、回文读数）已合并，不会制造歧义；存在两个条码类别时 `witnesses` 恒为
+两份稳定见证（重复调用次序确定）。
 
 ## 运行
 
