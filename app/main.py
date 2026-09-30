@@ -3,7 +3,10 @@
 环境变量 API_PORT 指定监听端口（默认 8080）。
 路由：
   GET  /health   -> {"status": "ok"}
-  POST /assemble -> {"sequences": [...]} -> unique / ambiguous / no_solution
+  POST /assemble -> {"sequences": [...], "unknown_orientation"?: bool}
+                    -> unique / ambiguous / no_solution
+unknown_orientation 缺省或为 false 时保持旧版请求与响应结构；为 true 时
+启用方向未知模式（逐条读数正向/反向互补与闭环次序联合求解）。
 """
 from __future__ import annotations
 
@@ -46,7 +49,10 @@ class Handler(BaseHTTPRequestHandler):
             data = json.loads(raw.decode("utf-8")) if raw else {}
             if not isinstance(data, dict) or "sequences" not in data:
                 raise ValidationError("请求体必须是包含 sequences 字段的 JSON 对象")
-            result = assemble(data["sequences"])
+            flag = data.get("unknown_orientation", False)
+            if not isinstance(flag, bool):
+                raise ValidationError("unknown_orientation 必须是布尔值（true/false）")
+            result = assemble(data["sequences"], unknown_orientation=flag)
             self._send_json(200, result)
         except ValidationError as exc:
             self._send_json(400, {"status": "invalid_input", "error": str(exc)})

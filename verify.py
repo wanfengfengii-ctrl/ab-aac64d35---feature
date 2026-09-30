@@ -4,7 +4,9 @@
   2. 构建自检（compileall 字节码编译）；
   3. 运行单元测试；
   4. 通过 HTTP 对 /assemble 做唯一、歧义、无解三类冒烟；
-  5. 汇总结果后自行退出，全部通过退出码 0，否则非零。
+  5. 对方向未知（unknown_orientation）模式做新旧兼容、唯一恢复、整批翻转
+     同类、歧义双见证、不可满足原因与折叠图断裂等业务冒烟；
+  6. 汇总结果后自行退出，全部通过退出码 0，否则非零。
 """
 from __future__ import annotations
 
@@ -49,10 +51,15 @@ def wait_ready(timeout: float = 60.0) -> bool:
     return False
 
 
-def post_assemble(reads: list[str]) -> tuple[int, dict]:
+def post_assemble(
+    reads: list[str], unknown_orientation: bool | None = None
+) -> tuple[int, dict]:
+    payload: dict = {"sequences": reads}
+    if unknown_orientation is not None:
+        payload["unknown_orientation"] = unknown_orientation
     req = urllib.request.Request(
         f"{BASE}/assemble",
-        data=json.dumps({"sequences": reads}).encode(),
+        data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
@@ -132,6 +139,114 @@ def smoke_invalid() -> None:
           f"code={code}")
 
 
+def smoke_unknown_orientation() -> None:
+    from barcode import reverse_complement
+
+    reads = ["AAT", "ATC", "TCG", "CGC", "GCA", "CAA"]
+
+    # 1) 未启用标志：响应结构与旧模式完全兼容（无方向字段）
+    code, body = post_assemble(reads)
+    check("冒烟-旧模式默认结构兼容",
+          code == 200 and "orientation_mode" not in body
+          and "orientation" not in body["evidence"][0],
+          f"status={body.get('status')}")
+
+    # 2) 部分读数丢失链方向（随机 RC），联合定向后恢复唯一规范条码
+    flipped = [reverse_complement(s) for s in
+               [reads[0], reads[2], reads[4]]]
+    batch = [flipped[0], reads[1], flipped[1], reads[3], flipped[2], reads[5]]
+    code, body = post_assemble(batch, unknown_orientation=True)
+    ok = (
+        code == 200
+        and body.get("status") == "unique"
+        and body.get("orientation_mode") == "unknown"
+        and body.get("canonical_barcode") == "AATCGC"
+        and sorted(body.get("order", [])) == list(range(1, 7))
+        and len(body.get("read_orientations", [])) == 6
+        and len(body.get("evidence", [])) == 6
+    )
+    # 逐项见证：方向、定向后序列、相邻重叠闭环一致
+    oriented = {
+        ro["read"]: ro["oriented_sequence"]
+        for ro in body.get("read_orientations", [])
+    }
+    for ev in body.get("evidence", []):
+        a, b = oriented.get(ev["prev"]), oriented.get(ev["next"])
+        ok = ok and a is not None and b is not None
+        ok = ok and ev.get("oriented_sequence") == a
+        ok = ok and ev["overlap"] == a[1:] == b[:-1]
+        ok = ok and ev.get("orientation") in ("forward", "reverse_complement")
+    expected_dirs = {1: "reverse_complement", 2: "forward",
+                     3: "reverse_complement", 4: "forward",
+                     5: "reverse_complement", 6: "forward"}
+    got_dirs = {ro["read"]: ro["orientation"]
+                for ro in body.get("read_orientations", [])}
+    check("冒烟-方向未知唯一恢复(逐项定向见证)",
+          bool(ok) and got_dirs == expected_dirs,
+          f"barcode={body.get('canonical_barcode')} dirs={got_dirs}")
+
+    # 3) 整批反向互补：同一规范类，不构成歧义
+    code, body = post_assemble(
+        [reverse_complement(s) for s in reads], unknown_orientation=True
+    )
+    check("冒烟-方向未知整批翻转同类",
+          code == 200 and body.get("status") == "unique"
+          and body.get("canonical_barcode") == "AATCGC",
+          f"status={body.get('status')}")
+
+    # 4) 两个规范类别：返回两份稳定见证
+    theta = ["AAC", "ACC", "AAG", "AGC", "GCC",
+             "CCA", "CAA", "CCG", "CGA", "GAA"]
+    code, body = post_assemble(theta, unknown_orientation=True)
+    witnesses = body.get("witnesses", [])
+    barcodes = sorted(w.get("canonical_barcode") for w in witnesses)
+    ok = (
+        code == 200 and body.get("status") == "ambiguous"
+        and len(witnesses) == 2 and len(set(barcodes)) == 2
+        and all(sorted(w.get("order", [])) == list(range(1, 11))
+                for w in witnesses)
+        and all(len(w.get("read_orientations", [])) == 10 for w in witnesses)
+    )
+    code2, body2 = post_assemble(theta, unknown_orientation=True)
+    stable = [w.get("canonical_barcode") for w in body2.get("witnesses", [])]
+    check("冒烟-方向未知歧义双见证且稳定",
+          bool(ok) and sorted(stable) == barcodes,
+          f"witnesses={barcodes}")
+
+    # 5) 任何逐条定向都无法闭环：方向约束不可满足，而非度数失衡
+    unsat = ["AAA", "AAA", "AAC", "ACA", "CAA", "CAA"]
+    code, body = post_assemble(unsat, unknown_orientation=True)
+    codes = {r.get("code") for r in body.get("reasons", [])}
+    check("冒烟-方向未知不可满足(非度数失衡)",
+          code == 200 and body.get("status") == "no_solution"
+          and codes == {"orientation_constraints_unsatisfiable"},
+          f"reasons={sorted(codes)}")
+
+    # 6) 折叠图不连通（定向无关的预检）
+    frag = ["AAA", "AAA", "CCC", "CCC", "GGG", "GGG"]
+    code, body = post_assemble(frag, unknown_orientation=True)
+    codes = {r.get("code") for r in body.get("reasons", [])}
+    check("冒烟-方向未知折叠图不连通",
+          code == 200 and body.get("status") == "no_solution"
+          and codes == {"orientation_fragmented_graph"},
+          f"reasons={sorted(codes)}")
+
+    # 7) 非法标志类型返回 400
+    req = urllib.request.Request(
+        f"{BASE}/assemble",
+        data=json.dumps({"sequences": reads,
+                         "unknown_orientation": "yes"}).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            bad_code = resp.status
+    except urllib.error.HTTPError as exc:
+        bad_code = exc.code
+    check("冒烟-方向标志非法 400", bad_code == 400, f"code={bad_code}")
+
+
 def main() -> int:
     print(f"verify: target={BASE}", flush=True)
     if not check("等待 API 就绪", wait_ready()):
@@ -153,6 +268,7 @@ def main() -> int:
     smoke_ambiguous()
     smoke_no_solution()
     smoke_invalid()
+    smoke_unknown_orientation()
 
     if failures:
         print(f"\nverify 失败 {len(failures)} 项: {failures}", flush=True)
